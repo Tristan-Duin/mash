@@ -74,7 +74,10 @@ at runtime.
 - Control flow: `if/elif/else/fi`, `while`, `until`, `for`, `case`,
   subshells `(…)`, groups `{…}`, functions, `!` negation.
 - Job control: `&`, `jobs`, `fg`, `bg`, `wait`.
-- Line editor: cursor motion, history, `Ctrl-A/E/K/U/W/L/C/D`.
+- Line editor: cursor motion, history, `Ctrl-A/E/K/U/W/L/C/D`, with
+  live syntax highlighting (keywords, builtins, operators, redirections,
+  strings, `$VAR`, `$(...)`, comments). Auto-disabled on non-TTY output
+  and when `NO_COLOR` is set or `TERM=dumb`.
 - Startup files: `/etc/mashrc`, `~/.mashrc`.
 
 Built-ins:
@@ -86,28 +89,6 @@ test  [  type  help  history  jobs  fg  bg  kill  wait  umask
 read  mask
 ```
 
-## Layout
-
-```
-include/        public headers
-src/            one .c per module
-  mask.c        rule engine
-  mask_fd.c     pump thread / fd wrapper
-  lexer.c       tokenizer
-  parser.c      recursive-descent parser
-  expand.c      tilde, param, cmdsub, arith, glob
-  executor.c    fork / exec / pipes / redirections
-  builtins.c    built-in commands
-  env.c         variables, aliases, functions
-  jobs.c        job tracking
-  signals.c     signal handling
-  history.c     masked history
-  lineedit.c    termios line editor
-  main.c        entry point + REPL
-tests/
-  test_mask.c   mask engine self-tests (make check)
-```
-
 ## Limitations
 
 - No process substitution `<(…)` / `>(…)`.
@@ -115,7 +96,3 @@ tests/
 - No associative arrays.
 - No multibyte-aware line editor (UTF-8 bytes still display correctly).
 - No native Windows build use WSL, Cygwin, or MSYS2.
-
-## License
-
-Add a license of your choice before distributing.

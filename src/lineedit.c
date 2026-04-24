@@ -25,6 +25,7 @@
 #include <termios.h>
 #include <unistd.h>
 
+#include "highlight.h"
 #include "history.h"
 #include "util.h"
 
@@ -55,6 +56,7 @@ typedef struct {
     size_t       cursor;         /* byte offset into line.data */
     history_t   *hist;
     size_t       hist_pos;       /* history_count when editing live */
+    bool         color;          /* emit ANSI colors during redraw */
     struct termios saved;
 } ed_t;
 
@@ -73,19 +75,24 @@ static void leave_raw(ed_t *e) { tcsetattr(e->fd_in, TCSANOW, &e->saved); }
 static void emit(ed_t *e, const char *s, size_t n) { (void)write_all(e->fd_out, s, n); }
 
 /* Redraw current line. We keep it simple: go to beginning of the line,
- * clear to end of line, write prompt + buffer, move back to cursor. */
+ * clear to end of line, write prompt + (highlighted) buffer, then move
+ * back to the cursor. The color escapes embedded by highlight_render are
+ * non-printing so they don't affect the cursor-back column count. */
 static void redraw(ed_t *e) {
-    emit(e, "\r", 1);              /* CR */
-    emit(e, "\x1b[2K", 4);          /* clear entire line */
-    emit(e, e->prompt, e->plen);
-    emit(e, e->line.data ? e->line.data : "", e->line.len);
-    /* Move cursor back from end to cursor position. */
+    strbuf_t out; strbuf_init(&out);
+    strbuf_append(&out, "\r", 1);                 /* CR */
+    strbuf_append(&out, "\x1b[2K", 4);            /* clear entire line */
+    if (e->plen) strbuf_append(&out, e->prompt, e->plen);
+    if (e->line.len) {
+        highlight_render(e->line.data, e->line.len, &out, e->color);
+    }
+    /* Move cursor back from end-of-line to the editing cursor. */
     if (e->cursor < e->line.len) {
         size_t back = e->line.len - e->cursor;
-        char buf[32];
-        int n = snprintf(buf, sizeof(buf), "\x1b[%zuD", back);
-        emit(e, buf, (size_t)n);
+        strbuf_appendf(&out, "\x1b[%zuD", back);
     }
+    if (out.len) emit(e, out.data, out.len);
+    strbuf_free(&out);
 }
 
 static void load_history_entry(ed_t *e, size_t idx_1based) {
@@ -116,6 +123,7 @@ char *lineedit_readline(int in_fd, int out_fd,
     e.plen   = strlen(e.prompt);
     e.hist   = hist;
     e.hist_pos = hist ? history_count(hist) : 0;
+    e.color    = highlight_color_enabled(out_fd);
     strbuf_init(&e.line);
 
     if (enter_raw(&e) < 0) {
