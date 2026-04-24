@@ -1,9 +1,9 @@
-# mash &mdash; Masked Shell
+# mash - Masked Shell
 
 A modern POSIX-style shell written in C whose distinguishing feature is a
 **masking layer**: every byte written through a shell-owned file descriptor
 is scanned and redacted on the way out, so sensitive values never reach a
-terminal, a file, or a log. Commands run normally &mdash; pipelines,
+terminal, a file, or a log. Commands run normally pipelines,
 redirections, job control, variables, functions, history. The mask just
 rewrites matches to `«CATEGORY»` placeholders.
 
@@ -38,19 +38,19 @@ Flags: `-c CMD`, `-i`, `-l`, `-s`, `--norc`, `-h`.
 
 Three rule sources are merged at startup:
 
-1. **Universal patterns** &mdash; emails, IPv4/IPv6, MACs, UUIDs, JWTs,
+1. **Universal patterns** emails, IPv4/IPv6, MACs, UUIDs, JWTs,
    AWS / GitHub / Google / Slack / Bearer tokens, IBANs, credit cards,
    SSNs, phone numbers, hex secrets (32/40/64 chars), PEM private-key
    blocks.
-2. **Runtime-derived literals** &mdash; `$USER`, `$LOGNAME`, `$SUDO_USER`,
+2. **Runtime-derived literals** `$USER`, `$LOGNAME`, `$SUDO_USER`,
    the passwd GECOS name, `$HOME`, hostname, UID/GID, every interface
    IPv4/IPv6/MAC, and `$SSH_CLIENT`, `$SSH_TTY`, `$SSH_CONNECTION`,
    `$MAIL`, `$MAILPATH`.
-3. **User rules** &mdash; added via the `mask` built-in or loaded from
+3. **User rules** added via the `mask` built-in or loaded from
    `~/.mashrc`.
 
-Every writable descriptor the shell hands out &mdash; stdout, stderr,
-files opened by `>` `>>` `&>` `2>`, and every pipe stage &mdash; is wrapped
+Every writable descriptor the shell hands out stdout, stderr,
+files opened by `>` `>>` `&>` `2>`, and every pipe stage is wrapped
 with a pump thread in the shell process that reads, masks, and writes.
 Command substitution `$(…)` masks captured output too. History is
 persisted already-masked.
@@ -114,7 +114,7 @@ tests/
 - No `[[ … ]]` extended tests.
 - No associative arrays.
 - No multibyte-aware line editor (UTF-8 bytes still display correctly).
-- No native Windows build &mdash; use WSL, Cygwin, or MSYS2.
+- No native Windows build use WSL, Cygwin, or MSYS2.
 
 ## License
 
