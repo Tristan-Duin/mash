@@ -466,6 +466,12 @@ static long arith_expr(arith_t *a) {
 static char *arith_eval(shell_t *sh, const char *src) {
     arith_t a = { .s = src, .sh = sh, .err = false };
     long v = arith_expr(&a);
+    /* Trailing junk in the expression also indicates a syntax error. */
+    skip_ws(&a);
+    if (a.err || *a.s) {
+        mash_err(1, "arithmetic: syntax error in '%s'", src);
+        return xstrdup("0");
+    }
     char buf[32];
     snprintf(buf, sizeof(buf), "%ld", v);
     return xstrdup(buf);

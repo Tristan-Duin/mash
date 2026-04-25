@@ -79,9 +79,17 @@ int history_save(history_t *h) {
     if (!f) return -1;
     for (size_t i = 0; i < h->count; i++) {
         const char *s = history_at(h, i);
-        if (s) fprintf(f, "%s\n", s); /* already masked at add time */
+        if (!s) continue;
+        /* If the write fails (e.g. ENOSPC, EIO) bail out so we don't
+         * silently produce a truncated history file. */
+        if (fprintf(f, "%s\n", s) < 0) {
+            fclose(f);
+            return -1;
+        }
     }
-    fclose(f);
+    /* fclose flushes any remaining buffered data; report write errors
+     * surfaced only at flush time. */
+    if (fclose(f) != 0) return -1;
     return 0;
 }
 

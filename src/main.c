@@ -118,7 +118,19 @@ int mash_run_file(shell_t *s, const char *path) {
     char buf[4096];
     size_t n;
     while ((n = fread(buf, 1, sizeof(buf), f)) > 0) strbuf_append(&b, buf, n);
-    fclose(f);
+    /* Distinguish a clean EOF from an I/O error so we don't silently
+     * execute a truncated script. */
+    if (ferror(f)) {
+        mash_err(1, "%s: read error: %s", path, strerror(errno));
+        fclose(f);
+        strbuf_free(&b);
+        return 1;
+    }
+    if (fclose(f) != 0) {
+        mash_err(1, "%s: close: %s", path, strerror(errno));
+        strbuf_free(&b);
+        return 1;
+    }
     int rc = mash_run_string(s, b.data ? b.data : "", path);
     strbuf_free(&b);
     return rc;
@@ -195,7 +207,11 @@ int main(int argc, char **argv) {
     shell_t sh;
     memset(&sh, 0, sizeof(sh));
     sh.real_stdout = dup(STDOUT_FILENO);
+    if (sh.real_stdout < 0)
+        die("dup(stdout): %s", strerror(errno));
     sh.real_stderr = dup(STDERR_FILENO);
+    if (sh.real_stderr < 0)
+        die("dup(stderr): %s", strerror(errno));
     sh.shell_pgid  = getpgrp();
     sh.progname    = xstrdup(argv[0] ? argv[0] : "mash");
     sh.env     = env_new();
@@ -211,14 +227,33 @@ int main(int argc, char **argv) {
     /* Wrap stdout/stderr through the mask. After this, *everything* the
      * shell writes to fd 1 or 2 is redacted. */
     mask_fd_t mstdout, mstderr;
+    bool mstdout_ok = false, mstderr_ok = false;
     if (mask_fd_wrap_write(sh.mask, sh.real_stdout, false, &mstdout) == 0) {
-        dup2(mstdout.write_fd, STDOUT_FILENO);
+        if (dup2(mstdout.write_fd, STDOUT_FILENO) < 0) {
+            mash_err(0, "dup2(masked stdout): %s", strerror(errno));
+            mask_fd_close(&mstdout);
+            sh.masked_stdout = STDOUT_FILENO;
+        } else {
+            sh.masked_stdout = STDOUT_FILENO;
+            mstdout_ok = true;
+        }
+    } else {
+        mash_err(0, "failed to install masked stdout: %s", strerror(errno));
         sh.masked_stdout = STDOUT_FILENO;
-    } else sh.masked_stdout = STDOUT_FILENO;
+    }
     if (mask_fd_wrap_write(sh.mask, sh.real_stderr, false, &mstderr) == 0) {
-        dup2(mstderr.write_fd, STDERR_FILENO);
+        if (dup2(mstderr.write_fd, STDERR_FILENO) < 0) {
+            mash_err(0, "dup2(masked stderr): %s", strerror(errno));
+            mask_fd_close(&mstderr);
+            sh.masked_stderr = STDERR_FILENO;
+        } else {
+            sh.masked_stderr = STDERR_FILENO;
+            mstderr_ok = true;
+        }
+    } else {
+        mash_err(0, "failed to install masked stderr: %s", strerror(errno));
         sh.masked_stderr = STDERR_FILENO;
-    } else sh.masked_stderr = STDERR_FILENO;
+    }
 
     /* Options */
     const char *cmd_str = NULL;
@@ -282,16 +317,34 @@ int main(int argc, char **argv) {
         strbuf_t b; strbuf_init(&b);
         char buf[4096];
         ssize_t n;
-        while ((n = read(STDIN_FILENO, buf, sizeof(buf))) > 0) strbuf_append(&b, buf, (size_t)n);
-        rc = mash_run_string(&sh, b.data ? b.data : "", "stdin");
+        bool read_err = false;
+        for (;;) {
+            n = read(STDIN_FILENO, buf, sizeof(buf));
+            if (n > 0) {
+                strbuf_append(&b, buf, (size_t)n);
+                continue;
+            }
+            if (n == 0) break;        /* EOF */
+            if (errno == EINTR) continue;
+            mash_err(1, "stdin: read error: %s", strerror(errno));
+            read_err = true;
+            break;
+        }
+        if (read_err) {
+            rc = 1;
+        } else {
+            rc = mash_run_string(&sh, b.data ? b.data : "", "stdin");
+        }
         strbuf_free(&b);
     }
 
-    /* Teardown. Close fd 1 and 2 so pumps get EOF, then join them. */
+    /* Teardown. Close fd 1 and 2 so pumps get EOF, then join them.
+     * Only close+drain wrappers we actually installed; otherwise we'd
+     * close uninitialized mask_fd_t state. */
     if (sh.masked_stdout == STDOUT_FILENO) close(STDOUT_FILENO);
     if (sh.masked_stderr == STDERR_FILENO) close(STDERR_FILENO);
-    mask_fd_close(&mstdout);
-    mask_fd_close(&mstderr);
+    if (mstdout_ok) mask_fd_close(&mstdout);
+    if (mstderr_ok) mask_fd_close(&mstderr);
 
     if (sh.real_stdout >= 0) close(sh.real_stdout);
     if (sh.real_stderr >= 0) close(sh.real_stderr);

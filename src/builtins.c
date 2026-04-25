@@ -617,8 +617,17 @@ static int b_umask(shell_t *sh, int argc, char **argv) {
     mode_t m = umask(022);
     umask(m);
     if (argc < 2) { mashf(stdout, "%04o\n", m); return 0; }
-    mode_t nm = (mode_t)strtol(argv[1], NULL, 8);
-    umask(nm);
+    /* Reject empty or non-octal arguments so a typo doesn't silently
+     * end up calling umask(0) and exposing newly created files. */
+    char *end = NULL;
+    errno = 0;
+    long parsed = strtol(argv[1], &end, 8);
+    if (errno != 0 || !end || end == argv[1] || *end != '\0' ||
+        parsed < 0 || parsed > 0777) {
+        mash_err(1, "umask: %s: invalid octal mask", argv[1]);
+        return 1;
+    }
+    umask((mode_t)parsed);
     return 0;
 }
 
@@ -626,9 +635,25 @@ static int b_umask(shell_t *sh, int argc, char **argv) {
 static int b_read(shell_t *sh, int argc, char **argv) {
     strbuf_t b; strbuf_init(&b);
     char c;
-    while (read(STDIN_FILENO, &c, 1) == 1) {
-        if (c == '\n') break;
-        strbuf_push(&b, c);
+    bool got_eof = true;
+    for (;;) {
+        ssize_t r = read(STDIN_FILENO, &c, 1);
+        if (r == 1) {
+            got_eof = false;
+            if (c == '\n') break;
+            strbuf_push(&b, c);
+            continue;
+        }
+        if (r == 0) break;                 /* EOF */
+        if (errno == EINTR) continue;       /* retry on signal */
+        mash_err(1, "read: %s", strerror(errno));
+        strbuf_free(&b);
+        return 1;
+    }
+    /* POSIX: read returns non-zero when nothing was read before EOF. */
+    if (got_eof && b.len == 0) {
+        strbuf_free(&b);
+        return 1;
     }
     const char *ifs = env_get(sh->env, "IFS");
     if (!ifs) ifs = " \t\n";

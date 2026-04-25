@@ -210,8 +210,20 @@ static int apply_redir(shell_t *sh, redir_t *r, redir_applied_t **list,
         /* Heredoc: the target word carries the *body*. Write to a pipe and
          * redirect from the read end. */
         int p[2];
-        if (pipe(p) < 0) { free(target); return -1; }
-        if (write_all(p[1], target, strlen(target)) < 0) { /* ignore */ }
+        if (pipe(p) < 0) {
+            mash_err(1, "pipe: %s", strerror(errno));
+            free(target);
+            return -1;
+        }
+        if (write_all(p[1], target, strlen(target)) < 0) {
+            /* Body too large for the pipe buffer or the writer side
+             * disappeared - either way the heredoc would be truncated. */
+            mash_err(1, "heredoc: %s", strerror(errno));
+            close(p[0]);
+            close(p[1]);
+            free(target);
+            return -1;
+        }
         close(p[1]);
         target_fd = p[0];
         break;
@@ -340,7 +352,12 @@ static int prepare_redirs_for_child(shell_t *sh, redir_t *redirs,
                 mash_err(1, "pipe: %s", strerror(errno));
                 rc = -1; break;
             }
-            (void)write_all(p[1], target, strlen(target));
+            if (write_all(p[1], target, strlen(target)) < 0) {
+                mash_err(1, "heredoc: %s", strerror(errno));
+                close(p[0]);
+                close(p[1]);
+                rc = -1; break;
+            }
             close(p[1]);
             int fl = fcntl(p[0], F_GETFD);
             if (fl >= 0) (void)fcntl(p[0], F_SETFD, fl | FD_CLOEXEC);
@@ -808,17 +825,21 @@ static int run_list(shell_t *sh, list_t *l) {
         if (l->seps[i] == SEP_AMP) {
             /* Background: fork the item. */
             pid_t pid = fork();
+            if (pid < 0) {
+                mash_err(1, "fork: %s", strerror(errno));
+                rc = 1;
+                if (sh->opts.errexit) break;
+                continue;
+            }
             if (pid == 0) {
                 signals_reset_for_child();
                 int r = exec_node(sh, item);
                 _exit(r & 0xFF);
             }
-            if (pid > 0) {
-                char buf[64];
-                snprintf(buf, sizeof(buf), "[bg %d]", (int)pid);
-                int jid = jobs_add(sh->jobs, pid, pid, buf);
-                mashf(stderr, "[%d] %d\n", jid, (int)pid);
-            }
+            char buf[64];
+            snprintf(buf, sizeof(buf), "[bg %d]", (int)pid);
+            int jid = jobs_add(sh->jobs, pid, pid, buf);
+            mashf(stderr, "[%d] %d\n", jid, (int)pid);
             rc = 0;
         } else {
             rc = exec_node(sh, item);
