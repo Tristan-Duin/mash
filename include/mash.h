@@ -17,6 +17,7 @@ struct env_t;
 struct mask_engine_t;
 struct job_list_t;
 struct history_t;
+struct mask_fd_t;
 
 /* Shell-level options toggled via `set -o`. */
 typedef struct {
@@ -49,6 +50,12 @@ typedef struct shell_t {
     struct mask_engine_t  *mask;
     struct job_list_t     *jobs;
     struct history_t      *history;
+    /* Optional: the mask-fd wrappers behind masked_stdout / masked_stderr.
+     * NULL when wrapping failed and the shell is writing directly to the
+     * raw fd. Used by mash_drain_output() to synchronise pump flushes
+     * with code paths that bypass the pump (e.g. interactive prompts). */
+    struct mask_fd_t      *masked_stdout_pump;
+    struct mask_fd_t      *masked_stderr_pump;
     char           *progname;         /* argv[0] */
     char          **pos_args;         /* $1..$N (NULL terminated) */
     size_t          pos_argc;
@@ -71,6 +78,11 @@ int  mash_raw_write(int real_fd, const void *buf, size_t len);
 
 /* Emit an error to the masked stderr and set $? to status. */
 void mash_err(int status, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
+
+/* Block until every byte previously written to masked_stdout / masked_stderr
+ * has reached the underlying terminal. Required before writing directly to
+ * real_stdout (e.g. an interactive prompt) so output stays in order. */
+void mash_drain_output(shell_t *s);
 
 /* Parse + run a snippet of source text. Returns the exit status of the last
  * command. Used by the REPL, -c, source, and scripts. */

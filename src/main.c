@@ -70,6 +70,15 @@ int mash_raw_write(int real_fd, const void *buf, size_t len) {
     return write_all(real_fd, buf, len);
 }
 
+void mash_drain_output(shell_t *s) {
+    if (!s) return;
+    /* Order matters: stderr first so any error message printed by the
+     * just-finished command lands on the terminal before the next
+     * prompt, even though stderr is mostly unbuffered in practice. */
+    if (s->masked_stderr_pump) mask_fd_drain(s->masked_stderr_pump);
+    if (s->masked_stdout_pump) mask_fd_drain(s->masked_stdout_pump);
+}
+
 void mash_err(int status, const char *fmt, ...) {
     shell_t *s = mash_active();
     int fd = s ? s->masked_stderr : STDERR_FILENO;
@@ -171,12 +180,21 @@ static char *build_prompt(shell_t *s) {
 static void repl(shell_t *s) {
     while (1) {
         jobs_cleanup(s->jobs);
+        /* Wait for the masked-stdout/stderr pumps to finish forwarding
+         * the previous command's output. The prompt is written directly
+         * to real_stdout to bypass the pump (it's already masked and
+         * carries line-editor escapes), so without this drain a long
+         * builtin's output and the next prompt race on the terminal. */
+        mash_drain_output(s);
+
         char *prompt = build_prompt(s);
         /* Write prompt directly to real stdout (it's already masked). */
         char *line = lineedit_readline(STDIN_FILENO, s->real_stdout, prompt, s->history);
         free(prompt);
         if (!line) {
-            /* EOF */
+            /* EOF: drain again so any trailing output is flushed before
+             * we print the closing newline. */
+            mash_drain_output(s);
             mashf_fd(s->real_stdout, "\n");
             break;
         }
@@ -235,6 +253,7 @@ int main(int argc, char **argv) {
             sh.masked_stdout = STDOUT_FILENO;
         } else {
             sh.masked_stdout = STDOUT_FILENO;
+            sh.masked_stdout_pump = &mstdout;
             mstdout_ok = true;
         }
     } else {
@@ -248,6 +267,7 @@ int main(int argc, char **argv) {
             sh.masked_stderr = STDERR_FILENO;
         } else {
             sh.masked_stderr = STDERR_FILENO;
+            sh.masked_stderr_pump = &mstderr;
             mstderr_ok = true;
         }
     } else {
@@ -340,7 +360,11 @@ int main(int argc, char **argv) {
 
     /* Teardown. Close fd 1 and 2 so pumps get EOF, then join them.
      * Only close+drain wrappers we actually installed; otherwise we'd
-     * close uninitialized mask_fd_t state. */
+     * close uninitialized mask_fd_t state. Clear the shell-side pump
+     * pointers first so any late mash_drain_output() call (e.g. from a
+     * destructor) becomes a no-op rather than touching freed state. */
+    sh.masked_stdout_pump = NULL;
+    sh.masked_stderr_pump = NULL;
     if (sh.masked_stdout == STDOUT_FILENO) close(STDOUT_FILENO);
     if (sh.masked_stderr == STDERR_FILENO) close(STDERR_FILENO);
     if (mstdout_ok) mask_fd_close(&mstdout);
