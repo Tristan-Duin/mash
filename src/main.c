@@ -189,7 +189,7 @@ static void repl(shell_t *s) {
 
         char *prompt = build_prompt(s);
         /* Write prompt directly to real stdout (it's already masked). */
-        char *line = lineedit_readline(STDIN_FILENO, s->real_stdout, prompt, s->history);
+        char *line = lineedit_readline(STDIN_FILENO, s->real_stdout, prompt, s->history, s);
         free(prompt);
         if (!line) {
             /* EOF: drain again so any trailing output is flushed before

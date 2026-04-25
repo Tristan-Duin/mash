@@ -14,6 +14,7 @@
 #include <stdbool.h>
 
 struct history_t;
+struct shell_t;
 
 /* Read a single logical line from the fd (usually STDIN_FILENO).
  *
@@ -23,9 +24,13 @@ struct history_t;
  *
  * If `hist` is non-NULL and the input is a TTY, up/down arrows navigate
  * its entries and the resulting line is appended to it on success.
+ *
+ * If `sh` is non-NULL, Tab triggers tab completion (commands on the first
+ * word, files/directories elsewhere).  Pass NULL to disable completion.
  */
 char *lineedit_readline(int in_fd, int out_fd,
                         const char *prompt,
-                        struct history_t *hist);
+                        struct history_t *hist,
+                        struct shell_t *sh);
 
 #endif /* MASH_LINEEDIT_H */

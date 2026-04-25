@@ -25,6 +25,7 @@
 #include <termios.h>
 #include <unistd.h>
 
+#include "complete.h"
 #include "highlight.h"
 #include "history.h"
 #include "util.h"
@@ -49,15 +50,17 @@ static char *read_raw_line(int fd) {
 /* -------------------------------------------------------- raw mode state */
 
 typedef struct {
-    int          fd_in, fd_out;
-    const char  *prompt;
-    size_t       plen;           /* prompt byte length */
-    strbuf_t     line;
-    size_t       cursor;         /* byte offset into line.data */
-    history_t   *hist;
-    size_t       hist_pos;       /* history_count when editing live */
-    bool         color;          /* emit ANSI colors during redraw */
-    struct termios saved;
+    int              fd_in, fd_out;
+    const char      *prompt;
+    size_t           plen;           /* prompt byte length */
+    strbuf_t         line;
+    size_t           cursor;         /* byte offset into line.data */
+    history_t       *hist;
+    size_t           hist_pos;       /* history_count when editing live */
+    bool             color;          /* emit ANSI colors during redraw */
+    struct termios   saved;
+    struct shell_t  *sh;             /* NULL disables tab completion */
+    bool             last_was_tab;   /* true when previous key was Tab */
 } ed_t;
 
 static int enter_raw(ed_t *e) {
@@ -105,11 +108,64 @@ static void load_history_entry(ed_t *e, size_t idx_1based) {
     redraw(e);
 }
 
+/* ------------------------------------------------- tab completion helpers */
+
+/* Replace line[ws .. ws+pfx_len) with `comp` and update cursor. */
+static void replace_word(ed_t *e, size_t ws, const char *comp, size_t comp_len) {
+    size_t pfx_len = e->cursor - ws;
+    size_t tail    = e->line.len - e->cursor;
+    if (comp_len > pfx_len)
+        strbuf_reserve(&e->line, comp_len - pfx_len);
+    memmove(e->line.data + ws + comp_len,
+            e->line.data + ws + pfx_len,
+            tail + 1);                        /* +1 to move the NUL */
+    memcpy(e->line.data + ws, comp, comp_len);
+    e->line.len = ws + comp_len + tail;
+    e->cursor   = ws + comp_len;
+}
+
+/* Length of the longest common prefix shared by all `n` completions. */
+static size_t common_prefix_len(char **comps, size_t n) {
+    if (n == 0) return 0;
+    size_t lcp = strlen(comps[0]);
+    for (size_t i = 1; i < n && lcp > 0; i++) {
+        size_t j = 0;
+        while (j < lcp && comps[0][j] == comps[i][j]) j++;
+        lcp = j;
+    }
+    return lcp;
+}
+
+/* Display completions in auto-sized columns (assumes 80-column terminal). */
+static void show_completions(ed_t *e, char **comps, size_t n) {
+    size_t max_len = 0;
+    for (size_t i = 0; i < n; i++) {
+        size_t l = strlen(comps[i]);
+        if (l > max_len) max_len = l;
+    }
+    size_t col_w = max_len + 2;
+    size_t cols  = col_w > 0 ? (80 / col_w) : 1;
+    if (cols < 1) cols = 1;
+
+    emit(e, "\r\n", 2);
+    for (size_t i = 0; i < n; i++) {
+        size_t l = strlen(comps[i]);
+        emit(e, comps[i], l);
+        if ((i + 1) % cols == 0 || i + 1 == n) {
+            emit(e, "\r\n", 2);
+        } else {
+            /* Pad to next column. */
+            for (size_t p = l; p < col_w; p++) emit(e, " ", 1);
+        }
+    }
+}
+
 /* --------------------------------------------------- key loop */
 
 char *lineedit_readline(int in_fd, int out_fd,
                         const char *prompt,
-                        history_t *hist) {
+                        history_t *hist,
+                        struct shell_t *sh) {
     if (!isatty(in_fd)) {
         if (prompt) (void)write_all(out_fd, prompt, strlen(prompt));
         return read_raw_line(in_fd);
@@ -121,9 +177,11 @@ char *lineedit_readline(int in_fd, int out_fd,
     e.fd_out = out_fd;
     e.prompt = prompt ? prompt : "";
     e.plen   = strlen(e.prompt);
-    e.hist   = hist;
-    e.hist_pos = hist ? history_count(hist) : 0;
-    e.color    = highlight_color_enabled(out_fd);
+    e.hist        = hist;
+    e.hist_pos    = hist ? history_count(hist) : 0;
+    e.color       = highlight_color_enabled(out_fd);
+    e.sh          = sh;
+    e.last_was_tab = false;
     strbuf_init(&e.line);
 
     if (enter_raw(&e) < 0) {
@@ -139,7 +197,62 @@ char *lineedit_readline(int in_fd, int out_fd,
         if (n == 0) { eof = true; break; }
         if (n < 0) { if (errno == EINTR) continue; eof = true; break; }
 
+        /* Snapshot and reset the tab flag; the Tab case may set it again. */
+        bool prev_tab      = e.last_was_tab;
+        e.last_was_tab     = false;
+
         switch (c) {
+        case 0x09: { /* Tab: complete */
+            if (!e.sh) break;
+            size_t pfx_len = 0;
+            const char *buf = e.line.data ? e.line.data : "";
+            char **comps = complete_generate(e.sh, buf, e.cursor, &pfx_len);
+            size_t nc = 0;
+            while (comps[nc]) nc++;
+
+            size_t ws = e.cursor - pfx_len;
+
+            if (nc == 0) {
+                /* No completions. */
+                emit(&e, "\a", 1);
+            } else if (nc == 1) {
+                /* Unique match: insert it and append a space (unless it ends
+                 * with '/', meaning it's a directory and the user likely
+                 * wants to continue typing a path). */
+                const char *comp = comps[0];
+                size_t clen = strlen(comp);
+                replace_word(&e, ws, comp, clen);
+                if (clen == 0 || comp[clen - 1] != '/') {
+                    strbuf_reserve(&e.line, 1);
+                    memmove(e.line.data + e.cursor + 1,
+                            e.line.data + e.cursor,
+                            e.line.len - e.cursor + 1);
+                    e.line.data[e.cursor] = ' ';
+                    e.line.len++;
+                    e.cursor++;
+                }
+                redraw(&e);
+            } else {
+                /* Multiple matches. */
+                size_t lcp = common_prefix_len(comps, nc);
+                if (!prev_tab) {
+                    /* First Tab: extend to the longest common prefix. */
+                    if (lcp > pfx_len) {
+                        replace_word(&e, ws, comps[0], lcp);
+                        redraw(&e);
+                    } else {
+                        emit(&e, "\a", 1);
+                    }
+                    e.last_was_tab = true;
+                } else {
+                    /* Second consecutive Tab: show all matches. */
+                    show_completions(&e, comps, nc);
+                    redraw(&e);
+                }
+            }
+            complete_free_list(comps);
+            break;
+        }
         case '\r': case '\n':
             emit(&e, "\r\n", 2);
             done = true;
