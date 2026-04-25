@@ -2,9 +2,12 @@
 
 #include "history.h"
 
+#include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
 #include "mask.h"
 #include "util.h"
@@ -75,8 +78,22 @@ int history_load(history_t *h) {
 
 int history_save(history_t *h) {
     if (!h->path) return 0;
-    FILE *f = fopen(h->path, "w");
-    if (!f) return -1;
+    /* Defense in depth: even though every persisted line has been masked
+     * already, the file may still contain a residual leak risk if a rule
+     * was missing at the time. Open with mode 0600 from the start (and
+     * fchmod afterwards in case the file pre-existed with looser perms).
+     * O_NOFOLLOW prevents following a symlink that might point at, say,
+     * an attacker-controlled path under a shared $HOME. */
+#ifndef O_NOFOLLOW
+# define O_NOFOLLOW 0
+#endif
+    int fd = open(h->path,
+                  O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW,
+                  S_IRUSR | S_IWUSR);
+    if (fd < 0) return -1;
+    (void)fchmod(fd, S_IRUSR | S_IWUSR);
+    FILE *f = fdopen(fd, "w");
+    if (!f) { close(fd); return -1; }
     for (size_t i = 0; i < h->count; i++) {
         const char *s = history_at(h, i);
         if (!s) continue;

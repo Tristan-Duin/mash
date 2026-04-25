@@ -28,6 +28,13 @@ CFLAGS   ?= $(CSTD) $(OPT) $(WARN) $(DEFS)
 LDFLAGS  ?=
 LDLIBS   ?= -lpthread
 
+# openpty(3) lives in libutil on glibc/Linux. macOS, FreeBSD, Cygwin, and
+# MSYS2 all expose it from libc, so only Linux needs the extra link line.
+UNAME_S  := $(shell uname -s 2>/dev/null)
+ifeq ($(UNAME_S),Linux)
+LDLIBS   += -lutil
+endif
+
 # ---- Layout ----------------------------------------------------------------
 
 SRC_DIR  := src

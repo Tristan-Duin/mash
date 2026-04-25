@@ -16,20 +16,361 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <fnmatch.h>
+#include <poll.h>
 #include <signal.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/ioctl.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
+#include <termios.h>
 #include <unistd.h>
+
+#if defined(__linux__) || defined(__sun) || defined(__CYGWIN__)
+#  include <pty.h>
+#elif defined(__APPLE__) || defined(__FreeBSD__) || defined(__NetBSD__) || \
+      defined(__OpenBSD__) || defined(__DragonFly__)
+#  include <util.h>
+#endif
 
 #include "builtins.h"
 #include "env.h"
 #include "expand.h"
 #include "jobs.h"
+#include "mash.h"
+#include "mask.h"
 #include "mask_fd.h"
 #include "signals.h"
 #include "util.h"
+
+/* Open an anonymous temp file for staging a heredoc body. Used instead of
+ * a pipe so a heredoc larger than the kernel's pipe buffer cannot deadlock
+ * the parent at write_all() time. Returns a writable+readable fd at offset
+ * 0, or -1 on failure. The file is unlinked from the filesystem before we
+ * return so it disappears on close. */
+static int open_heredoc_tmp(void) {
+    const char *tmpdir = getenv("TMPDIR");
+    if (!tmpdir || !*tmpdir) tmpdir = "/tmp";
+    char tpl[512];
+    int n = snprintf(tpl, sizeof(tpl), "%s/mash-heredoc-XXXXXX", tmpdir);
+    if (n < 0 || (size_t)n >= sizeof(tpl)) return -1;
+    int fd = mkstemp(tpl);
+    if (fd < 0) return -1;
+    /* unlink immediately - the file is anonymous from here on. */
+    (void)unlink(tpl);
+    int flags = fcntl(fd, F_GETFD);
+    if (flags >= 0) (void)fcntl(fd, F_SETFD, flags | FD_CLOEXEC);
+    return fd;
+}
+
+/* In any forked shell-child (subshell, pipeline stage, background `&`),
+ * close the saved raw stdout/stderr fds the parent shell holds. Without
+ * this they remain open in the child as fd-3+ alongside the masked fd 1/2,
+ * which means user shell code or sloppy programs could write directly to
+ * them and bypass the mask. CLOEXEC handles the exec(2) case; this covers
+ * shell code that runs inside the fork without execing. */
+static void close_raw_fds_in_child(shell_t *sh) {
+    if (!sh) return;
+    if (sh->real_stdout >= 0) { close(sh->real_stdout); sh->real_stdout = -1; }
+    if (sh->real_stderr >= 0) { close(sh->real_stderr); sh->real_stderr = -1; }
+}
+
+/* Forward decl - apply_assigns is defined further below alongside the
+ * other dispatch helpers, but the pty path needs to call it from within
+ * the child to honour `VAR=val cmd ...` prefix assignments. */
+static int apply_assigns(shell_t *sh, assign_t *a, bool exported_temp,
+                         assign_t **saved_out);
+
+/* Allowlist of programs that genuinely need a real terminal. We only
+ * route through the pty path for these - everything else (`ls`, `cat`,
+ * `whoami`, `grep`, ...) keeps using the pumped-fd path, which has been
+ * the default since day one, is simpler, and never has to fight with
+ * raw mode / OPOST / line-discipline corner cases.
+ *
+ * We match on the basename of argv[0]; absolute paths like
+ * `/usr/bin/vim` and bare `vim` both hit the same entry. */
+static bool argv0_needs_pty(const char *cmd) {
+    if (!cmd || !*cmd) return false;
+    const char *base = strrchr(cmd, '/');
+    base = base ? base + 1 : cmd;
+    static const char *const TUI_NAMES[] = {
+        /* editors */
+        "vim", "vi", "nvim", "neovim", "view", "ex", "vile",
+        "nano", "pico", "joe", "emacs", "mg", "ne", "ed", "jed",
+        /* pagers / readers */
+        "less", "more", "most", "pg", "man", "info",
+        /* monitors */
+        "htop", "top", "btop", "btm", "glances", "atop", "iotop",
+        "iftop", "nethogs", "powertop",
+        /* remote shells */
+        "ssh", "slogin", "mosh", "mosh-client", "telnet", "rlogin",
+        /* multiplexers */
+        "tmux", "screen", "dvtm", "abduco", "dtach", "byobu",
+        /* file managers */
+        "mc", "ranger", "nnn", "vifm", "lf", "fff", "clifm",
+        /* browsers / mail / chat */
+        "w3m", "lynx", "links", "elinks", "browsh",
+        "mutt", "neomutt", "alpine", "pine", "sup",
+        "irssi", "weechat", "bitlbee", "profanity",
+        /* git / k8s / docker tuis */
+        "tig", "lazygit", "lazydocker", "k9s", "gitui",
+        /* misc */
+        "ncdu", "cmus", "ncmpcpp", "moc", "calcurse", "taskwarrior",
+        "watch", "dialog", "whiptail",
+        NULL
+    };
+    for (size_t i = 0; TUI_NAMES[i]; i++) {
+        if (str_eq(base, TUI_NAMES[i])) return true;
+    }
+    return false;
+}
+
+/* ---------------------------------------------------------- pty execution
+ *
+ * For interactive foreground externals (no redirections) we hand the child
+ * a real pseudo-terminal via openpty(3) instead of pump-piped fds. The
+ * child then sees `isatty(0/1/2) == true`, full termios, and a controlling
+ * tty - so vim, less, htop, ssh, and friends behave normally. The parent
+ * forwards bytes between the user's real tty and the master, running every
+ * byte coming back from the child through the mask engine before it lands
+ * on the screen.
+ *
+ * Why this is safe to add even with the lockdown story: the child writes
+ * only to the slave; the slave loops to the master in the parent; from
+ * there bytes flow exclusively through `mask_stream_push` to real_stdout.
+ * There is no path from the child's stdout to the user's terminal that
+ * doesn't pass through the mask engine.
+ */
+
+/* Communicating window-size changes from the SIGWINCH handler back into
+ * the forwarding loop. We don't call ioctl from the handler; we just set
+ * a flag and let the loop refresh the slave's winsize the next time poll()
+ * returns. */
+static volatile sig_atomic_t pty_winch_flag;
+static void pty_handle_winch(int sig) { (void)sig; pty_winch_flag = 1; }
+
+/* Run an external command on a pty. Preconditions: shell is interactive,
+ * the simple command has no redirections, the user's stdin/real_stdout
+ * are real ttys.
+ *
+ * Returns the child's wait status code. The special return value -2 means
+ * "this command is not eligible for the pty path - fall back to the
+ * pumped-fd path" (e.g. real_stdout isn't a tty, or openpty failed in a
+ * recoverable way). */
+#define PTY_FALLBACK (-2)
+
+static int run_external_via_pty(shell_t *sh, simple_t *s, char **argv) {
+    int tty_fd = sh->real_stdout;
+    if (tty_fd < 0 || !isatty(tty_fd))   return PTY_FALLBACK;
+    if (!isatty(STDIN_FILENO))           return PTY_FALLBACK;
+
+    struct termios saved_term;
+    if (tcgetattr(tty_fd, &saved_term) < 0) return PTY_FALLBACK;
+
+    struct winsize ws;
+    bool have_ws = (ioctl(tty_fd, TIOCGWINSZ, &ws) == 0);
+
+    /* Make sure the previous command's output has fully drained through
+     * the masked-stdout pump before we start writing to real_stdout from
+     * this loop. Otherwise the two write paths can interleave on screen. */
+    mash_drain_output(sh);
+
+    int master = -1, slave = -1;
+    if (openpty(&master, &slave, NULL, &saved_term, have_ws ? &ws : NULL) < 0) {
+        mash_err(1, "openpty: %s", strerror(errno));
+        return -1;
+    }
+    /* CLOEXEC the master so it doesn't leak into anything we sub-fork.
+     * Master stays blocking on purpose: write_all() does not understand
+     * EAGAIN, so a non-blocking master would silently drop keystrokes
+     * forwarded to the slave whenever the slave's input queue was even
+     * briefly full - which is exactly what made vim feel "broken" (it
+     * never received `:`, `i`, `q`, etc.). The parent's read side is
+     * driven by poll() so blocking is fine on that side too. */
+    int f = fcntl(master, F_GETFD);
+    if (f >= 0) (void)fcntl(master, F_SETFD, f | FD_CLOEXEC);
+
+    pid_t pid = fork();
+    if (pid < 0) {
+        mash_err(1, "fork: %s", strerror(errno));
+        close(master);
+        close(slave);
+        return -1;
+    }
+    if (pid == 0) {
+        /* --- child --- */
+        signals_reset_for_child();
+        close_raw_fds_in_child(sh);
+        close(master);
+        if (setsid() < 0) _exit(127);
+#ifdef TIOCSCTTY
+        (void)ioctl(slave, TIOCSCTTY, 0);
+#endif
+        if (dup2(slave, STDIN_FILENO)  < 0 ||
+            dup2(slave, STDOUT_FILENO) < 0 ||
+            dup2(slave, STDERR_FILENO) < 0) _exit(127);
+        if (slave > STDERR_FILENO) close(slave);
+
+        apply_assigns(sh, s->assigns, true, NULL);
+        for (var_t *v = sh->env->vars; v; v = v->next) {
+            if (v->exported && v->value) setenv(v->name, v->value, 1);
+        }
+        execvp(argv[0], argv);
+        /* execvp failed; the message goes through the slave -> master ->
+         * mask -> screen. */
+        mash_err(127, "%s: %s", argv[0], strerror(errno));
+        _exit(127);
+    }
+
+    /* --- parent --- */
+    close(slave);
+
+    /* IMPORTANT: do NOT call setpgid(pid, pid) here. There is a fork
+     * race: if the parent's setpgid landed before the child's setsid()
+     * (which it often did on fast Linux kernels), the child became a
+     * process-group leader, and POSIX requires setsid() to fail with
+     * EPERM for a pgrp leader. The child would then silently _exit(127),
+     * the parent's master would see EOF, and the whole pty session would
+     * vanish in milliseconds - exactly the "vim Makefile -> immediately
+     * back to prompt with no output" symptom.
+     *
+     * The child's setsid() already creates a brand-new session AND a new
+     * process group (with the child as leader) atomically, and TIOCSCTTY
+     * on the slave attaches the slave as the new session's controlling
+     * terminal. That is sufficient for vim/less/htop/ssh to behave
+     * correctly. We don't tcsetpgrp the real tty either: the child is in
+     * a different session now (POSIX wouldn't let us), and Ctrl-C/Z
+     * still reach the child via byte-forwarding through the slave's
+     * line discipline. */
+
+    /* Put the user's tty into FULLY raw mode (input AND output) for the
+     * duration of the pty session. This is the standard pattern used by
+     * tmux / screen / `ssh -t` / `script`: the slave inside the pty
+     * already applies whatever output processing the running program
+     * wants (cooked / raw / etc.), and the parent's job is just to
+     * forward bytes byte-for-byte. Leaving OPOST/ONLCR on at the parent
+     * tty would graft an extra `\n` -> `\r\n` translation on top of
+     * already-translated output, which scribbles over a TUI's screen
+     * drawing (vim, less, htop, ...). The reason `whoami` etc. don't
+     * suffer from full raw mode is that they no longer take the pty
+     * path - argv0_needs_pty() routes them through the pumped-fd path. */
+    struct termios raw = saved_term;
+    cfmakeraw(&raw);
+    (void)tcsetattr(tty_fd, TCSANOW, &raw);
+
+    /* Window-size forwarding. We deliberately do NOT use SA_RESTART so
+     * SIGWINCH wakes poll() with EINTR, which lets us re-run the loop
+     * head and forward the new winsize to the slave promptly. */
+    pty_winch_flag = 0;
+    struct sigaction sa, sa_old_winch;
+    sa.sa_handler = pty_handle_winch;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0;
+    sigaction(SIGWINCH, &sa, &sa_old_winch);
+
+    mask_stream_t ms;
+    mask_stream_init(&ms, sh->mask);
+
+    char buf[4096];
+    bool master_eof = false;
+    while (!master_eof) {
+        if (pty_winch_flag) {
+            pty_winch_flag = 0;
+            struct winsize w;
+            if (ioctl(tty_fd, TIOCGWINSZ, &w) == 0)
+                (void)ioctl(master, TIOCSWINSZ, &w);
+        }
+
+        struct pollfd pfd[2];
+        pfd[0].fd = STDIN_FILENO; pfd[0].events = POLLIN; pfd[0].revents = 0;
+        pfd[1].fd = master;       pfd[1].events = POLLIN; pfd[1].revents = 0;
+
+        /* Same idle-flush trick as the fd pumps: if we have buffered
+         * bytes, wake every 25 ms to push out anything that's safe so a
+         * line-less burst from a TUI doesn't get held. */
+        int timeout = (ms.pending.len == 0) ? -1 : 25;
+        int pr = poll(pfd, 2, timeout);
+        if (pr < 0) {
+            if (errno == EINTR) continue;
+            break;
+        }
+        if (pr == 0) {
+            strbuf_t out; strbuf_init(&out);
+            mask_stream_idle_flush(&ms, &out);
+            if (out.len) (void)write_all(tty_fd, out.data, out.len);
+            strbuf_free(&out);
+            continue;
+        }
+
+        if (pfd[0].revents & POLLIN) {
+            ssize_t n = read(STDIN_FILENO, buf, sizeof(buf));
+            if (n > 0) (void)write_all(master, buf, (size_t)n);
+            /* If real-stdin closes the child still runs; we just stop
+             * forwarding from it. */
+        }
+        if (pfd[1].revents & (POLLIN | POLLHUP | POLLERR)) {
+            /* Read whatever the kernel has queued. POSIX guarantees that
+             * any bytes the slave wrote before disconnecting come back
+             * here before read() ever returns 0 / EIO, so we don't need
+             * a non-blocking drain loop - if more data is pending after
+             * this read, poll() will simply wake us with POLLIN again. */
+            ssize_t n = read(master, buf, sizeof(buf));
+            if (n > 0) {
+                strbuf_t out; strbuf_init(&out);
+                mask_stream_push(&ms, buf, (size_t)n, &out);
+                if (out.len) (void)write_all(tty_fd, out.data, out.len);
+                strbuf_free(&out);
+            } else if (n == 0) {
+                master_eof = true;
+            } else if (errno != EINTR) {
+                /* On Linux read(master) returns -1/EIO once the slave is
+                 * fully closed; treat that and other unrecoverable errors
+                 * as EOF. */
+                master_eof = true;
+            }
+        }
+    }
+
+    /* Final flush of anything held in the mask stream. */
+    {
+        strbuf_t out; strbuf_init(&out);
+        mask_stream_finish(&ms, &out);
+        if (out.len) (void)write_all(tty_fd, out.data, out.len);
+        strbuf_free(&out);
+    }
+    mask_stream_free(&ms);
+
+    int st = 0;
+    pid_t r = waitpid(pid, &st, WUNTRACED);
+    bool stopped = (r > 0 && WIFSTOPPED(st));
+
+    /* Restore signals and terminal modes. We didn't change the
+     * foreground pgrp on the real tty (the child lives in a different
+     * session entirely), so there's nothing to restore there. */
+    sigaction(SIGWINCH, &sa_old_winch, NULL);
+    (void)tcsetattr(tty_fd, TCSANOW, &saved_term);
+    close(master);
+
+    if (stopped) {
+        /* User backgrounded with Ctrl-Z. Track the stopped child as a job
+         * so `jobs`, `fg`, `bg` can pick it up. */
+        char jbuf[64];
+        snprintf(jbuf, sizeof(jbuf), "[stopped %d]", (int)pid);
+        int jid = jobs_add(sh->jobs, pid, pid, jbuf);
+        for (job_t *j = sh->jobs->head; j; j = j->next)
+            if (j->id == jid) { j->state = JOB_STOPPED; break; }
+        mashf(stderr, "\n[%d]+  Stopped\n", jid);
+        sh->last_status = 128 + WSTOPSIG(st);
+        return sh->last_status;
+    }
+
+    int code = WIFEXITED(st)
+             ? WEXITSTATUS(st)
+             : 128 + (WIFSIGNALED(st) ? WTERMSIG(st) : 0);
+    sh->last_status = code;
+    return code;
+}
 
 /* ------------------------------------------------------------ forward decl */
 
@@ -207,25 +548,23 @@ static int apply_redir(shell_t *sh, redir_t *r, redir_applied_t **list,
     }
     case R_HEREDOC:
     case R_HEREDOC_STRIP: {
-        /* Heredoc: the target word carries the *body*. Write to a pipe and
-         * redirect from the read end. */
-        int p[2];
-        if (pipe(p) < 0) {
-            mash_err(1, "pipe: %s", strerror(errno));
-            free(target);
-            return -1;
-        }
-        if (write_all(p[1], target, strlen(target)) < 0) {
-            /* Body too large for the pipe buffer or the writer side
-             * disappeared - either way the heredoc would be truncated. */
+        /* Heredoc: the target word carries the *body*. Stage it in an
+         * anonymous temp file (rather than a pipe) so arbitrarily large
+         * bodies never deadlock at write time. */
+        int fd = open_heredoc_tmp();
+        if (fd < 0) {
             mash_err(1, "heredoc: %s", strerror(errno));
-            close(p[0]);
-            close(p[1]);
             free(target);
             return -1;
         }
-        close(p[1]);
-        target_fd = p[0];
+        if (write_all(fd, target, strlen(target)) < 0 ||
+            lseek(fd, 0, SEEK_SET) < 0) {
+            mash_err(1, "heredoc: %s", strerror(errno));
+            close(fd);
+            free(target);
+            return -1;
+        }
+        target_fd = fd;
         break;
     }
     }
@@ -347,21 +686,20 @@ static int prepare_redirs_for_child(shell_t *sh, redir_t *redirs,
         }
         case R_HEREDOC:
         case R_HEREDOC_STRIP: {
-            int p[2];
-            if (pipe(p) < 0) {
-                mash_err(1, "pipe: %s", strerror(errno));
-                rc = -1; break;
-            }
-            if (write_all(p[1], target, strlen(target)) < 0) {
+            /* Anonymous tempfile so big heredocs don't deadlock on the
+             * pre-fork write_all(). */
+            int fd = open_heredoc_tmp();
+            if (fd < 0) {
                 mash_err(1, "heredoc: %s", strerror(errno));
-                close(p[0]);
-                close(p[1]);
                 rc = -1; break;
             }
-            close(p[1]);
-            int fl = fcntl(p[0], F_GETFD);
-            if (fl >= 0) (void)fcntl(p[0], F_SETFD, fl | FD_CLOEXEC);
-            e->src_fd = p[0];
+            if (write_all(fd, target, strlen(target)) < 0 ||
+                lseek(fd, 0, SEEK_SET) < 0) {
+                mash_err(1, "heredoc: %s", strerror(errno));
+                close(fd);
+                rc = -1; break;
+            }
+            e->src_fd = fd;
             break;
         }
         }
@@ -513,6 +851,23 @@ static int run_simple(shell_t *sh, node_t *n, bool in_fork) {
 
     /* External: fork unless we're already a child. */
     if (!in_fork) {
+        /* Interactive foreground command with no redirections that is on
+         * the TUI allowlist: route it through a pty so the child sees a
+         * real terminal (isatty == true, full termios, controlling tty
+         * for Ctrl-C/Ctrl-Z). Output still passes through the mask
+         * engine before reaching the user. Everything else - the vast
+         * majority of commands - stays on the pumped-fd path, which is
+         * the well-tested default. We fall back to the pumped-fd path
+         * if the pty path declines (e.g. real_stdout isn't a tty). */
+        if (sh->opts.interactive && s->redirs == NULL &&
+            argv0_needs_pty(argv[0])) {
+            int rc = run_external_via_pty(sh, s, argv);
+            if (rc != PTY_FALLBACK) {
+                free_argv(argv);
+                return rc;
+            }
+        }
+
         /* Pre-wrap all redirections in the parent so mask pump threads
          * live here (the shell stays alive) and survive the child's
          * execvp, which would otherwise destroy any pthread we started. */
@@ -532,6 +887,7 @@ static int run_simple(shell_t *sh, node_t *n, bool in_fork) {
         }
         if (pid == 0) {
             signals_reset_for_child();
+            close_raw_fds_in_child(sh);
             apply_prep_in_child(prep);
             apply_assigns(sh, s->assigns, true, NULL);
             /* We rely on apply_assigns() to have already called setenv for
@@ -596,19 +952,41 @@ static int run_pipeline(shell_t *sh, node_t *n) {
      * via a mask wrapper so data is masked before reaching stage i+1. */
     int *pipes = xcalloc(count - 1, sizeof(int) * 2);
     mask_fd_t *mfds = xcalloc(count - 1, sizeof(*mfds));
+    bool *mfds_ok = xcalloc(count - 1, sizeof(*mfds_ok));
     pid_t *pids = xcalloc(count, sizeof(*pids));
     /* Per-stage, parent-held prep for any redirs attached to the stage's
      * simple command (e.g., `cmd > file` inside a pipeline). */
     redir_prep_t **stage_preps = xcalloc(count, sizeof(*stage_preps));
 
+    /* Pre-init pipes[] entries to -1 so the cleanup label can tell which
+     * have actually been opened. */
+    for (size_t i = 0; i + 1 < count; i++) {
+        pipes[2*i]     = -1;
+        pipes[2*i + 1] = -1;
+    }
+    size_t built = 0;        /* pipes[0..built-1] fully constructed */
+    size_t spawned = 0;      /* pids[0..spawned-1] are valid */
+    int    setup_err = 0;
+
     for (size_t i = 0; i + 1 < count; i++) {
         int p[2];
-        if (pipe(p) < 0) die("pipe: %s", strerror(errno));
-        /* Wrap the write end. */
-        if (mask_fd_wrap_write(sh->mask, p[1], true, &mfds[i]) < 0)
-            die("mask_fd_wrap_write failed");
-        pipes[2*i]     = p[0]; /* reader */
+        if (pipe(p) < 0) {
+            mash_err(1, "pipe: %s", strerror(errno));
+            setup_err = 1;
+            goto pipeline_cleanup;
+        }
+        /* Wrap the write end so bytes flowing into stage i+1 are masked. */
+        if (mask_fd_wrap_write(sh->mask, p[1], true, &mfds[i]) < 0) {
+            mash_err(1, "mask_fd_wrap_write: %s", strerror(errno));
+            close(p[0]);
+            close(p[1]);
+            setup_err = 1;
+            goto pipeline_cleanup;
+        }
+        mfds_ok[i]     = true;
+        pipes[2*i]     = p[0];
         pipes[2*i + 1] = mfds[i].write_fd; /* masked writer the child sees */
+        built++;
     }
 
     for (size_t i = 0; i < count; i++) {
@@ -627,9 +1005,15 @@ static int run_pipeline(shell_t *sh, node_t *n) {
         g_pending_child_prep = stage_preps[i];
 
         pid_t pid = fork();
-        if (pid < 0) die("fork: %s", strerror(errno));
+        if (pid < 0) {
+            mash_err(1, "fork: %s", strerror(errno));
+            g_pending_child_prep = NULL;
+            setup_err = 1;
+            goto pipeline_cleanup;
+        }
         if (pid == 0) {
             signals_reset_for_child();
+            close_raw_fds_in_child(sh);
             /* Set up stdin from previous pipe. */
             if (i > 0) {
                 dup2(pipes[2*(i-1)], STDIN_FILENO);
@@ -650,6 +1034,7 @@ static int run_pipeline(shell_t *sh, node_t *n) {
          * starts clean. The prep itself is still owned by stage_preps[i]. */
         g_pending_child_prep = NULL;
         pids[i] = pid;
+        spawned++;
     }
     /* Parent closes all pipe fds so EOF propagates. pipes[2*i + 1] aliases
      * mfds[i].write_fd; mark it closed on the mask_fd_t so mask_fd_close()
@@ -675,12 +1060,40 @@ static int run_pipeline(shell_t *sh, node_t *n) {
      * any mask_fd_t and joins that pump too). */
     for (size_t i = 0; i < count; i++) redir_prep_free_parent(stage_preps[i]);
 
-    free(pipes); free(mfds); free(pids); free(stage_preps);
+    free(pipes); free(mfds); free(mfds_ok); free(pids); free(stage_preps);
 
     int rc = sh->opts.pipefail ? (any_nonzero ? any_nonzero : last_status)
                                : last_status;
     sh->last_status = rc;
     return rc;
+
+pipeline_cleanup:
+    /* Setup failure path. Reap whatever we did manage to fork, tear the
+     * partially-built mask pumps and pipes down, and report a generic
+     * error. We deliberately do NOT die() here so transient EMFILE / EAGAIN
+     * doesn't take the whole shell down. */
+    g_pending_child_prep = NULL;
+    /* Close the pipe fds we still own so any spawned children see EOF. */
+    for (size_t i = 0; i < built; i++) {
+        if (pipes[2*i]     >= 0) close(pipes[2*i]);
+        if (pipes[2*i + 1] >= 0) {
+            close(pipes[2*i + 1]);
+            mfds[i].write_fd = -1;
+        }
+    }
+    for (size_t i = 0; i < spawned; i++) {
+        int st = 0;
+        (void)waitpid(pids[i], &st, 0);
+    }
+    for (size_t i = 0; i < built; i++) {
+        if (mfds_ok[i]) mask_fd_close(&mfds[i]);
+    }
+    for (size_t i = 0; i < count; i++) {
+        if (stage_preps[i]) redir_prep_free_parent(stage_preps[i]);
+    }
+    free(pipes); free(mfds); free(mfds_ok); free(pids); free(stage_preps);
+    sh->last_status = setup_err ? 1 : 0;
+    return sh->last_status;
 }
 
 static int run_simple_or_compound_in_child(shell_t *sh, node_t *n) {
@@ -778,6 +1191,7 @@ static int run_subshell(shell_t *sh, node_t *n) {
     if (pid < 0) { mash_err(1, "fork: %s", strerror(errno)); return 1; }
     if (pid == 0) {
         signals_reset_for_child();
+        close_raw_fds_in_child(sh);
         int rc = exec_node(sh, n->u.inner);
         _exit(rc & 0xFF);
     }
@@ -833,6 +1247,7 @@ static int run_list(shell_t *sh, list_t *l) {
             }
             if (pid == 0) {
                 signals_reset_for_child();
+                close_raw_fds_in_child(sh);
                 int r = exec_node(sh, item);
                 _exit(r & 0xFF);
             }

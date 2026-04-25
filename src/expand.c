@@ -293,6 +293,11 @@ int expand_run_capture(shell_t *sh, const char *src, char **out_str) {
         if (sh->masked_stderr >= 0 && sh->masked_stderr != STDERR_FILENO) {
             dup2(sh->masked_stderr, STDERR_FILENO);
         }
+        /* The cmdsub child runs shell code without execing, so CLOEXEC
+         * doesn't help. Drop the saved raw fds so a `printf >&3` or
+         * similar can't bypass the mask. */
+        if (sh->real_stdout >= 0) { close(sh->real_stdout); sh->real_stdout = -1; }
+        if (sh->real_stderr >= 0) { close(sh->real_stderr); sh->real_stderr = -1; }
         /* Execute src as shell commands in the same process. */
         int rc = mash_run_string(sh, src, "cmdsub");
         _exit(rc & 0xFF);
@@ -318,9 +323,13 @@ int expand_run_capture(shell_t *sh, const char *src, char **out_str) {
     }
     close(pfd[0]);
     if (wrapped) {
-        /* join pump thread */
-        pthread_join(mfd.thread, NULL);
-        mfd.thread_started = false;
+        /* mask_fd_close handles every piece of pump teardown:
+         *   - write_fd is already -1 (so it's a no-op there)
+         *   - joins the pump thread
+         *   - closes the drain self-pipe write end
+         *   - destroys the drain mutex / condvar
+         * Calling pthread_join() directly leaked all of those. */
+        mask_fd_close(&mfd);
     }
 
     int st = 0;

@@ -6,9 +6,14 @@
  * a custom template. Rule ordering matters: more specific rules first
  * (e.g. private key blocks before generic hex secrets).
  *
- * The streaming variant is line-oriented: we accumulate bytes until we see
- * a '\n', then mask_apply the completed line. If the pending buffer grows
- * past `max_line` we flush it unconditionally to bound memory.
+ * The streaming variant flushes on the *last* newline rather than each one,
+ * so multi-line rules (notably the BEGIN..END PEM redactor) match across
+ * lines. While a `-----BEGIN ... PRIVATE KEY-----` marker has no matching
+ * `-----END` we hold the buffer (up to a hard cap) so the closing line can
+ * arrive before any of the body is emitted. When forced to flush a giant
+ * no-newline buffer we keep a small overlap tail so word-boundary patterns
+ * straddling the boundary remain matchable on the next push. In binary
+ * mode the same overlap technique catches matches across chunk boundaries.
  */
 
 #include "mask.h"
@@ -26,6 +31,18 @@
 #include <sys/types.h>
 #include <sys/utsname.h>
 #include <unistd.h>
+
+/* Streaming bounds. Selected so a typical PEM private-key block (~4 KB)
+ * easily fits, while a runaway producer can never blow up shell memory.
+ *
+ * MASK_STREAM_OVERLAP must comfortably exceed the longest secret a rule
+ * may match. JWTs and PEM bodies are the long-tail cases (a few KB), so
+ * 8 KB gives headroom. Smaller overlap (e.g. 256 B) was *not* enough
+ * because a force-flush happening mid-secret would emit the secret's
+ * head unmasked while only the suffix remained in pending. */
+#define MASK_STREAM_LINE_SOFT  (64 * 1024)        /* force-flush past this if no NL */
+#define MASK_STREAM_BLOCK_MAX  (16 * 1024 * 1024) /* hard cap regardless of state */
+#define MASK_STREAM_OVERLAP    (8 * 1024)         /* retained tail for boundary matches */
 
 #if defined(__linux__) || defined(__FreeBSD__) || defined(__NetBSD__) || defined(__OpenBSD__)
 # include <net/if.h>
@@ -124,10 +141,33 @@ int mask_add_pattern(mask_engine_t *e, mask_cat_t cat,
 
     int rc = regcomp(&r->re, pattern, REG_EXTENDED);
     if (rc != 0) {
-        char buf[256];
-        regerror(rc, &r->re, buf, sizeof(buf));
-        fprintf(stderr, "mash: regex compile failed for \"%s\": %s\n",
-                pattern, buf);
+        char regbuf[256];
+        regerror(rc, &r->re, regbuf, sizeof(regbuf));
+        /* The pattern may have been derived from a sensitive literal
+         * (mask_add_literal escapes the value verbatim). Mask the
+         * diagnostic through whatever rules are already loaded so a
+         * typo in `mask literal EMAIL alice@example.com` doesn't
+         * echo the secret to the raw stderr. If no rules exist yet
+         * (very early init), elide the pattern entirely. */
+        char raw[1024];
+        int  rlen = snprintf(raw, sizeof(raw),
+                             "mash: regex compile failed for \"%s\": %s\n",
+                             pattern, regbuf);
+        if (rlen < 0) rlen = 0;
+        if ((size_t)rlen > sizeof(raw)) rlen = (int)sizeof(raw);
+        if (e->rules) {
+            char  *masked = NULL;
+            size_t mlen   = 0;
+            mask_apply(e, raw, (size_t)rlen, &masked, &mlen);
+            (void)write_all(STDERR_FILENO,
+                            masked ? masked : raw,
+                            masked ? mlen   : (size_t)rlen);
+            free(masked);
+        } else {
+            const char *fallback =
+                "mash: regex compile failed (pattern elided)\n";
+            (void)write_all(STDERR_FILENO, fallback, strlen(fallback));
+        }
         free(r->pattern_src);
         free(r);
         return -1;
@@ -172,6 +212,12 @@ int mask_add_literal(mask_engine_t *e, mask_cat_t cat, const char *literal) {
 int mask_set_disabled(mask_engine_t *e, size_t idx, bool disabled) {
     if (!e) return -1;
     pthread_mutex_lock(&e->lock);
+    /* Disabling weakens redaction; refuse if locked. Re-enabling is OK. */
+    if (disabled && e->locked) {
+        pthread_mutex_unlock(&e->lock);
+        errno = EPERM;
+        return -1;
+    }
     mask_rule_t *r = e->rules;
     size_t i = 0;
     while (r && i < idx) { r = r->next; i++; }
@@ -184,6 +230,11 @@ int mask_set_disabled(mask_engine_t *e, size_t idx, bool disabled) {
 int mask_remove(mask_engine_t *e, size_t idx) {
     if (!e) return -1;
     pthread_mutex_lock(&e->lock);
+    if (e->locked) {
+        pthread_mutex_unlock(&e->lock);
+        errno = EPERM;
+        return -1;
+    }
     mask_rule_t **cur = &e->rules;
     size_t i = 0;
     while (*cur && i < idx) { cur = &(*cur)->next; i++; }
@@ -197,6 +248,21 @@ int mask_remove(mask_engine_t *e, size_t idx) {
     }
     pthread_mutex_unlock(&e->lock);
     return rc;
+}
+
+void mask_engine_lock(mask_engine_t *e) {
+    if (!e) return;
+    pthread_mutex_lock(&e->lock);
+    e->locked = true;
+    pthread_mutex_unlock(&e->lock);
+}
+
+bool mask_engine_is_locked(mask_engine_t *e) {
+    if (!e) return false;
+    pthread_mutex_lock(&e->lock);
+    bool v = e->locked;
+    pthread_mutex_unlock(&e->lock);
+    return v;
 }
 
 void mask_foreach(mask_engine_t *e,
@@ -296,8 +362,10 @@ void mask_apply(mask_engine_t *e,
 
 void mask_stream_init(mask_stream_t *ms, mask_engine_t *e) {
     memset(ms, 0, sizeof(*ms));
-    ms->engine   = e;
-    ms->max_line = 64 * 1024;
+    ms->engine       = e;
+    ms->max_line     = MASK_STREAM_LINE_SOFT;
+    ms->block_max    = MASK_STREAM_BLOCK_MAX;
+    ms->overlap_tail = MASK_STREAM_OVERLAP;
     strbuf_init(&ms->pending);
 }
 
@@ -306,14 +374,71 @@ void mask_stream_free(mask_stream_t *ms) {
     memset(ms, 0, sizeof(*ms));
 }
 
-static void flush_pending(mask_stream_t *ms, strbuf_t *out) {
-    if (ms->pending.len == 0) return;
+/* Naive substring search. memmem() is non-portable; this is invoked at
+ * most a handful of times per push so the simple loop is fine. */
+static const char *find_substr(const char *hay, size_t hay_len,
+                               const char *needle, size_t nlen) {
+    if (nlen == 0) return hay;
+    if (hay_len < nlen) return NULL;
+    for (size_t i = 0; i + nlen <= hay_len; i++) {
+        if (memcmp(hay + i, needle, nlen) == 0) return hay + i;
+    }
+    return NULL;
+}
+
+/* True if `pending` contains an opened multi-line secret block (a
+ * "-----BEGIN" marker that has no matching "-----END" yet). When this
+ * holds, we delay flushing so mask_apply() can run the multi-line PEM
+ * rule against BEGIN..END atomically.
+ *
+ * The marker is intentionally generic ("-----BEGIN"): it covers any
+ * PEM-like block (RSA / EC / OPENSSH / DSA / encrypted PRIVATE KEY,
+ * certificate request bodies, etc.) without us having to enumerate
+ * every variant the rules know about. */
+static bool has_open_multiline_block(const char *data, size_t len) {
+    static const char BEGIN_M[] = "-----BEGIN";
+    static const char END_M[]   = "-----END";
+    const size_t blen = sizeof(BEGIN_M) - 1;
+    const size_t elen = sizeof(END_M)   - 1;
+
+    /* Walk every BEGIN; only declare "open" if the *last* BEGIN has no
+     * subsequent END. A second BEGIN-END pair within the same buffer is
+     * fine because the rule will match each block independently. */
+    const char *cursor = data;
+    size_t      remain = len;
+    const char *last_begin = NULL;
+    for (;;) {
+        const char *b = find_substr(cursor, remain, BEGIN_M, blen);
+        if (!b) break;
+        last_begin = b;
+        size_t advance = (size_t)(b - cursor) + blen;
+        cursor = cursor + advance;
+        remain = remain >= advance ? remain - advance : 0;
+    }
+    if (!last_begin) return false;
+    size_t after = (size_t)(last_begin - data) + blen;
+    if (after > len) after = len;
+    return find_substr(data + after, len - after, END_M, elen) == NULL;
+}
+
+/* Apply rules to the first `n` bytes of pending, emit them, and shift the
+ * remainder back to the start of the buffer. Caller is responsible for
+ * choosing a `n` that does not split a multi-line secret. */
+static void flush_prefix(mask_stream_t *ms, size_t n, strbuf_t *out) {
+    if (n == 0) return;
+    if (n > ms->pending.len) n = ms->pending.len;
     char  *masked = NULL;
-    size_t mlen = 0;
-    mask_apply(ms->engine, ms->pending.data, ms->pending.len, &masked, &mlen);
-    strbuf_append(out, masked, mlen);
+    size_t mlen   = 0;
+    mask_apply(ms->engine, ms->pending.data, n, &masked, &mlen);
+    if (masked && mlen) strbuf_append(out, masked, mlen);
     free(masked);
-    strbuf_reset(&ms->pending);
+    if (ms->pending.len > n) {
+        memmove(ms->pending.data, ms->pending.data + n, ms->pending.len - n);
+        ms->pending.len -= n;
+    } else {
+        ms->pending.len = 0;
+    }
+    if (ms->pending.data) ms->pending.data[ms->pending.len] = '\0';
 }
 
 void mask_stream_push(mask_stream_t *ms,
@@ -322,9 +447,7 @@ void mask_stream_push(mask_stream_t *ms,
     if (len == 0) return;
 
     /* Heuristic binary detection: too many NULs => stream is likely binary.
-     * We still mask, but line-batching would break; instead we fall back to
-     * masking each incoming chunk independently. Derived-literal rules are
-     * byte-oriented so they still catch the important leaks. */
+     * We still mask, but line-batching would break. */
     for (size_t i = 0; i < len; i++) if (buf[i] == '\0') ms->bytes_null++;
     ms->bytes_total += len;
     if (!ms->binary_detected && ms->bytes_total >= 4096 &&
@@ -332,37 +455,65 @@ void mask_stream_push(mask_stream_t *ms,
         ms->binary_detected = true;
     }
 
+    /* Always accumulate first; flush_prefix() decides what's safe to emit. */
+    strbuf_append(&ms->pending, buf, len);
+
     if (ms->binary_detected) {
-        flush_pending(ms, out);
-        char  *m = NULL;
-        size_t ml = 0;
-        mask_apply(ms->engine, buf, len, &m, &ml);
-        strbuf_append(out, m, ml);
-        free(m);
+        /* Retain a small overlap tail so a token straddling chunk boundaries
+         * is still seen as one unit by mask_apply on the next push. */
+        if (ms->pending.len > ms->overlap_tail) {
+            flush_prefix(ms, ms->pending.len - ms->overlap_tail, out);
+        }
+        if (ms->pending.len >= ms->block_max) {
+            flush_prefix(ms, ms->pending.len, out);
+        }
         return;
     }
 
-    /* Append; flush each complete line. */
-    size_t start = 0;
-    for (size_t i = 0; i < len; i++) {
-        if (buf[i] == '\n') {
-            strbuf_append(&ms->pending, buf + start, (i - start) + 1);
-            flush_pending(ms, out);
-            start = i + 1;
-        }
-    }
-    if (start < len) {
-        strbuf_append(&ms->pending, buf + start, len - start);
+    /* Hold off flushing while a multi-line secret block is open and we
+     * still have headroom. Once the closing marker arrives mask_apply
+     * matches BEGIN..END as a single replacement. */
+    if (ms->pending.len < ms->block_max &&
+        has_open_multiline_block(ms->pending.data, ms->pending.len)) {
+        return;
     }
 
-    /* Bound pending to avoid unbounded memory for giant one-liners. */
+    /* Flush up to the last newline so multi-line patterns within a single
+     * batch (e.g. a PEM block whose BEGIN and END are now both present)
+     * are masked as a unit rather than line by line. */
+    size_t last_nl = 0;
+    for (size_t i = ms->pending.len; i > 0; i--) {
+        if (ms->pending.data[i - 1] == '\n') { last_nl = i; break; }
+    }
+    if (last_nl) flush_prefix(ms, last_nl, out);
+
+    /* If we still exceed the soft cap we have a giant no-newline blob.
+     * Force-flush, but leave a small overlap tail so word-boundary patterns
+     * straddling the boundary remain matchable on the next push. */
     if (ms->pending.len >= ms->max_line) {
-        flush_pending(ms, out);
+        size_t tail = ms->pending.len > ms->overlap_tail ? ms->overlap_tail : 0;
+        if (ms->pending.len > tail) {
+            flush_prefix(ms, ms->pending.len - tail, out);
+        }
+    }
+
+    /* And as a hard ceiling, never grow without bound. */
+    if (ms->pending.len >= ms->block_max) {
+        flush_prefix(ms, ms->pending.len, out);
     }
 }
 
 void mask_stream_finish(mask_stream_t *ms, strbuf_t *out) {
-    flush_pending(ms, out);
+    if (ms->pending.len) flush_prefix(ms, ms->pending.len, out);
+}
+
+void mask_stream_idle_flush(mask_stream_t *ms, strbuf_t *out) {
+    if (!ms || ms->pending.len == 0) return;
+    /* Don't break a multi-line secret in half just because the wire went
+     * idle. The block_max safety net in mask_stream_push will eventually
+     * force the issue if BEGIN never gets its END. */
+    if (has_open_multiline_block(ms->pending.data, ms->pending.len)) return;
+    flush_prefix(ms, ms->pending.len, out);
 }
 
 /* ----------------------------------------------------------- rule seeding */

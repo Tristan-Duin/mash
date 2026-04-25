@@ -62,10 +62,27 @@ static bool pump_read_available(mask_fd_t *m, mask_stream_t *st,
     }
 }
 
+/* Flush bytes that are safe to emit immediately. Used both during the
+ * idle window (poll timeout) and right after consuming new input, so a
+ * line-less burst from a TUI like vim doesn't sit in `pending` waiting
+ * for a newline. The mask_stream_idle_flush helper itself refuses to
+ * split a multi-line secret block so the masking guarantee holds. */
+static void pump_emit_idle(mask_fd_t *m, mask_stream_t *st) {
+    strbuf_t tail; strbuf_init(&tail);
+    mask_stream_idle_flush(st, &tail);
+    if (tail.len) (void)write_all(m->real_fd, tail.data, tail.len);
+    strbuf_free(&tail);
+}
+
 static void *pump_main(void *arg) {
     mask_fd_t    *m = arg;
     mask_stream_t st;
     mask_stream_init(&st, m->engine);
+
+    /* Idle window: when there are buffered bytes, wake at this cadence to
+     * emit anything safe. 25 ms is fast enough that vim/less feel native
+     * but slow enough that the wake cost is negligible (~40 Hz). */
+    static const int IDLE_FLUSH_MS = 25;
 
     char buf[8192];
     bool eof = false;
@@ -74,10 +91,16 @@ static void *pump_main(void *arg) {
         pfd[0].fd = m->internal_read;  pfd[0].events = POLLIN;  pfd[0].revents = 0;
         pfd[1].fd = m->wakeup_r;       pfd[1].events = POLLIN;  pfd[1].revents = 0;
 
-        int pr = poll(pfd, 2, -1);
+        int timeout = (st.pending.len == 0) ? -1 : IDLE_FLUSH_MS;
+        int pr = poll(pfd, 2, timeout);
         if (pr < 0) {
             if (errno == EINTR) continue;
             break;
+        }
+        if (pr == 0) {
+            /* Idle: push out anything that's safe to push. */
+            pump_emit_idle(m, &st);
+            continue;
         }
 
         /* Wake-up byte (sent by mask_fd_drain); content is irrelevant. */

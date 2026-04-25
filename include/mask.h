@@ -68,11 +68,18 @@ typedef struct mask_rule_t {
 
 /* Engine. Protect additions/removals with `lock`; the hot-path reader
  * (mask_apply / mask_stream_push) also takes lock briefly. Since rules are
- * effectively immutable after startup the contention is negligible. */
+ * effectively immutable after startup the contention is negligible.
+ *
+ * The `locked` flag implements a one-way lockdown: once set (via
+ * `mask_engine_lock`, the `mask lock` builtin, or `--mask-lock`), removing
+ * or disabling rules is refused and `set -o nomask-cmdsub` will be
+ * rejected. Adding new rules and re-enabling disabled ones is still
+ * allowed because both strengthen redaction. */
 typedef struct mask_engine_t {
     mask_rule_t     *rules;
     size_t           rule_count;
     pthread_mutex_t  lock;
+    bool             locked;
 } mask_engine_t;
 
 /* --------------------------------------------------------------- lifecycle */
@@ -97,9 +104,16 @@ int  mask_add_pattern(mask_engine_t *e, mask_cat_t cat,
 int  mask_add_literal(mask_engine_t *e, mask_cat_t cat,
                       const char *literal);
 
-/* Disable / enable / remove by 0-based index (order stable). */
+/* Disable / enable / remove by 0-based index (order stable). When the
+ * engine is locked, mask_remove() and mask_set_disabled(.., true) return
+ * -1 without modifying state; re-enabling (false) is always allowed. */
 int  mask_set_disabled(mask_engine_t *e, size_t idx, bool disabled);
 int  mask_remove(mask_engine_t *e, size_t idx);
+
+/* One-way lockdown. After mask_engine_lock() returns the engine refuses
+ * any operation that would weaken redaction. There is no unlock. */
+void mask_engine_lock(mask_engine_t *e);
+bool mask_engine_is_locked(mask_engine_t *e);
 
 /* Walk all rules; cb returns false to stop. */
 void mask_foreach(mask_engine_t *e,
@@ -114,12 +128,25 @@ void mask_apply(mask_engine_t *e,
 
 /* ----------------------------------------------------------- streaming api */
 
-/* Line-oriented streaming state. Partial last line is retained until the
- * next push or until mask_stream_finish() forces a flush. */
+/* Streaming state.
+ *
+ * The engine holds bytes back until they can be safely masked as a unit:
+ *   - text mode: flush on the last newline so multi-line patterns
+ *     (e.g. PEM private key blocks) match across line boundaries.
+ *     If a -----BEGIN ... PRIVATE KEY----- marker is seen without its
+ *     matching -----END the buffer keeps growing up to a hard cap so
+ *     the multi-line redaction rule fires atomically.
+ *   - binary mode: retain a small overlap tail so cross-chunk matches
+ *     succeed; force-flush past the hard cap.
+ *   - in either mode, when force-flushing we leave a small tail behind
+ *     so word-boundary patterns that straddle the boundary still match
+ *     on the next push. */
 typedef struct {
     mask_engine_t *engine;
     strbuf_t       pending;          /* unflushed tail */
-    size_t         max_line;         /* force-flush if pending exceeds this */
+    size_t         max_line;         /* soft cap before force-flush */
+    size_t         block_max;        /* hard cap on retained bytes */
+    size_t         overlap_tail;     /* bytes kept across force-flushes */
     bool           binary_detected;  /* set once if >1% NULs seen */
     size_t         bytes_total;
     size_t         bytes_null;
@@ -136,5 +163,12 @@ void mask_stream_push(mask_stream_t *ms,
 /* Drain remaining buffered bytes. After this, the stream is ready for reuse
  * via a fresh push or may be freed. */
 void mask_stream_finish(mask_stream_t *ms, strbuf_t *out);
+
+/* Emit anything in the buffer that is *safe* to emit immediately - i.e.
+ * everything unless an open multi-line secret block (a -----BEGIN... line
+ * with no -----END... yet) would be split. Used by pump threads as an
+ * idle-window flush so interactive TUIs (vim, less, ...) don't appear to
+ * hang waiting for a \n that never comes. */
+void mask_stream_idle_flush(mask_stream_t *ms, strbuf_t *out);
 
 #endif /* MASH_MASK_H */

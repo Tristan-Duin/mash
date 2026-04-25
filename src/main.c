@@ -212,11 +212,12 @@ static void repl(shell_t *s) {
 static void usage(void) {
     const char *u =
         "Usage: mash [options] [script [args...]]\n"
-        "  -c CMD    execute CMD and exit\n"
-        "  -i        force interactive mode\n"
-        "  -l        act as a login shell\n"
-        "  --norc    do not read rc files\n"
-        "  -s        read commands from stdin\n"
+        "  -c CMD       execute CMD and exit\n"
+        "  -i           force interactive mode\n"
+        "  -l           act as a login shell\n"
+        "  --norc       do not read rc files\n"
+        "  --mask-lock  lock the mask engine after startup (no remove/disable)\n"
+        "  -s           read commands from stdin\n"
         "  -h, --help\n";
     write_all(STDERR_FILENO, u, strlen(u));
 }
@@ -224,12 +225,27 @@ static void usage(void) {
 int main(int argc, char **argv) {
     shell_t sh;
     memset(&sh, 0, sizeof(sh));
+    /* Pre-set the masked-output fds to the real stdio numbers. Without this
+     * any mash_err() emitted before the mask wrappers are installed (e.g.
+     * during option parsing or rc loading) would write to fd 0 (stdin). */
+    sh.masked_stdout = STDOUT_FILENO;
+    sh.masked_stderr = STDERR_FILENO;
+
     sh.real_stdout = dup(STDOUT_FILENO);
     if (sh.real_stdout < 0)
         die("dup(stdout): %s", strerror(errno));
     sh.real_stderr = dup(STDERR_FILENO);
     if (sh.real_stderr < 0)
         die("dup(stderr): %s", strerror(errno));
+    /* Mark the saved raw fds CLOEXEC so a child can never `dup2(3,1)` or
+     * write to /proc/self/fd/3 to bypass the masking pumps. The shell
+     * itself never execs, so this only matters in spawned children. */
+    {
+        int f = fcntl(sh.real_stdout, F_GETFD);
+        if (f >= 0) (void)fcntl(sh.real_stdout, F_SETFD, f | FD_CLOEXEC);
+        f = fcntl(sh.real_stderr, F_GETFD);
+        if (f >= 0) (void)fcntl(sh.real_stderr, F_SETFD, f | FD_CLOEXEC);
+    }
     sh.shell_pgid  = getpgrp();
     sh.progname    = xstrdup(argv[0] ? argv[0] : "mash");
     sh.env     = env_new();
@@ -279,6 +295,7 @@ int main(int argc, char **argv) {
     const char *cmd_str = NULL;
     const char *script  = NULL;
     bool force_inter = false;
+    bool want_mask_lock = false;
     int i = 1;
     for (; i < argc; i++) {
         const char *a = argv[i];
@@ -286,6 +303,7 @@ int main(int argc, char **argv) {
         if (str_eq(a, "-i")) { force_inter = true; continue; }
         if (str_eq(a, "-l") || (a[0] == '-' && a[1] == '\0')) { sh.opts.login = true; continue; }
         if (str_eq(a, "--norc")) { sh.opts.norc = true; continue; }
+        if (str_eq(a, "--mask-lock")) { want_mask_lock = true; continue; }
         if (str_eq(a, "-s")) continue;
         if (str_eq(a, "-h") || str_eq(a, "--help")) { usage(); return 0; }
         if (str_eq(a, "--")) { i++; break; }
@@ -313,6 +331,11 @@ int main(int argc, char **argv) {
             strbuf_free(&b);
         }
     }
+
+    /* If the operator requested a locked engine on the command line, lock
+     * now - after rc files (which may legitimately add rules) but before
+     * any user input. There is no unlock. */
+    if (want_mask_lock) mask_engine_lock(sh.mask);
 
     /* History persistence path. */
     const char *home = env_get(sh.env, "HOME");

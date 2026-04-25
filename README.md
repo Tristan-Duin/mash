@@ -32,7 +32,13 @@ compiler, pthreads, POSIX regex, termios, and `getifaddrs`.
 ./mash script.sh a b c   # run a script
 ```
 
-Flags: `-c CMD`, `-i`, `-l`, `-s`, `--norc`, `-h`.
+Flags: `-c CMD`, `-i`, `-l`, `-s`, `--norc`, `--mask-lock`, `-h`.
+
+`--mask-lock` puts the masking engine into a one-way lockdown after rc
+files have been processed: subsequent `mask remove`, `mask disable`, and
+`set -o nomask-cmdsub` are refused. Adding more rules and re-enabling
+disabled rules is still allowed (both strengthen redaction). The same
+state can be reached interactively with `mask lock`.
 
 ## How masking works
 
@@ -55,9 +61,26 @@ with a pump thread in the shell process that reads, masks, and writes.
 Command substitution `$(…)` masks captured output too. History is
 persisted already-masked.
 
+### Interactive programs and pseudo-terminals
+
+Full-screen TUIs like `vim`, `less`, `htop`, `top`, and `ssh` need a
+real terminal, not a pipe. When the shell is interactive and a
+foreground external command has no redirections, mash runs it on a
+pseudo-terminal opened with `openpty(3)`: the child sees `isatty(0)`,
+`isatty(1)`, and `isatty(2)` all return true, has full termios control,
+and owns the controlling tty so `Ctrl-C` and `Ctrl-Z` are delivered
+directly to it. The parent forwards keystrokes from the user's real
+tty to the master, masks every byte coming back from the child, and
+then writes the redacted output to the screen. Window-size changes
+(`SIGWINCH`) and `Ctrl-Z` (job control) are forwarded transparently.
+Masking is therefore preserved end-to-end even for full-screen
+applications. On Linux, this requires linking against `-lutil` (handled
+automatically by the Makefile).
+
 Use `mask show` to list rules, `mask add CAT PATTERN`, `mask literal CAT
 STRING`, `mask disable N`, `mask enable N`, `mask remove N` to manage them
-at runtime.
+at runtime, and `mask lock` to enter the irreversible lockdown described
+above.
 
 ## Shell features
 

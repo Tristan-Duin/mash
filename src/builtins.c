@@ -88,7 +88,7 @@ static const builtin_t TABLE[] = {
     { "wait",     b_wait,     "wait [PID|%N]" },
     { "umask",    b_umask,    "umask [MODE]" },
     { "read",     b_read,     "read VAR..." },
-    { "mask",     b_mask,     "mask [show|disable N|enable N|add CAT PAT|literal CAT STR]" },
+    { "mask",     b_mask,     "mask [show|disable N|enable N|remove N|add CAT PAT|literal CAT STR|lock]" },
 };
 #define N_BUILTINS (sizeof(TABLE)/sizeof(TABLE[0]))
 
@@ -292,7 +292,16 @@ static int b_set(shell_t *sh, int argc, char **argv) {
                     else if (str_eq(opt, "nounset"))  sh->opts.nounset = on;
                     else if (str_eq(opt, "xtrace"))   sh->opts.xtrace = on;
                     else if (str_eq(opt, "pipefail")) sh->opts.pipefail = on;
-                    else if (str_eq(opt, "nomask-cmdsub")) sh->opts.nomask_cmdsub = on;
+                    else if (str_eq(opt, "nomask-cmdsub")) {
+                        /* Turning the command-substitution mask off weakens
+                         * redaction; refuse it once the engine is locked.
+                         * Turning it back on (off->off or on->off) is fine. */
+                        if (on && mask_engine_is_locked(sh->mask)) {
+                            mash_err(1, "set: nomask-cmdsub: blocked by locked mask engine");
+                            return 1;
+                        }
+                        sh->opts.nomask_cmdsub = on;
+                    }
                     else { mash_err(1, "set: unknown option %s", opt); return 1; }
                 } else {
                     mash_err(1, "set: unknown flag -%c", *p);
@@ -700,11 +709,17 @@ static mask_cat_t cat_from_name(const char *s) {
 
 static int b_mask(shell_t *sh, int argc, char **argv) {
     if (argc < 2 || str_eq(argv[1], "show")) {
-        mashf(stdout, "%zu active mask rules\n", sh->mask->rule_count);
+        mashf(stdout, "%zu active mask rules%s\n",
+              sh->mask->rule_count,
+              mask_engine_is_locked(sh->mask) ? " (locked)" : "");
         mask_foreach(sh->mask, show_rule_cb, NULL);
         return 0;
     }
     if (str_eq(argv[1], "disable") && argc >= 3) {
+        if (mask_engine_is_locked(sh->mask)) {
+            mash_err(1, "mask: engine locked; rules cannot be disabled");
+            return 1;
+        }
         if (mask_set_disabled(sh->mask, (size_t)atol(argv[2]), true) < 0)
             { mash_err(1, "no such rule"); return 1; }
         return 0;
@@ -715,6 +730,10 @@ static int b_mask(shell_t *sh, int argc, char **argv) {
         return 0;
     }
     if (str_eq(argv[1], "remove") && argc >= 3) {
+        if (mask_engine_is_locked(sh->mask)) {
+            mash_err(1, "mask: engine locked; rules cannot be removed");
+            return 1;
+        }
         if (mask_remove(sh->mask, (size_t)atol(argv[2])) < 0)
             { mash_err(1, "no such rule"); return 1; }
         return 0;
@@ -725,6 +744,13 @@ static int b_mask(shell_t *sh, int argc, char **argv) {
     if (str_eq(argv[1], "literal") && argc >= 4) {
         return mask_add_literal(sh->mask, cat_from_name(argv[2]), argv[3]) == 0 ? 0 : 1;
     }
-    mash_err(2, "mask: usage: mask [show|disable N|enable N|remove N|add CAT PAT|literal CAT STR]");
+    if (str_eq(argv[1], "lock")) {
+        /* One-way switch: after this, mask_remove() and
+         * mask_set_disabled(.., true) refuse, and `set -o nomask-cmdsub`
+         * is rejected. There is no `mask unlock`. */
+        mask_engine_lock(sh->mask);
+        return 0;
+    }
+    mash_err(2, "mask: usage: mask [show|disable N|enable N|remove N|add CAT PAT|literal CAT STR|lock]");
     return 2;
 }
